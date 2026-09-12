@@ -144,6 +144,30 @@ function ImportForm() {
 				return;
 			}
 			const raw = readFileSync(file, "utf8");
+
+			// Detect the encrypted full-backup (.rayconfig) — NOT a snippet export.
+			// Raycast's "Export Settings & Data" writes an encrypted bundle here;
+			// snippet exports come from "Export Snippets" as plain JSON.
+			if (/\.rayconfig$/i.test(file)) {
+				await showToast({
+					style: Toast.Style.Failure,
+					title: "This is an encrypted backup (.rayconfig)",
+					message:
+						"Use Raycast → 'Export Snippets' instead of 'Export Settings & Data' — it saves a plain JSON this importer can read.",
+				});
+				return;
+			}
+			// gzip magic bytes 1f 8b, or NUL bytes => binary, not plain JSON.
+			if (!/[\s\S]{0,2}\x1f\x8b/.test(raw) && (raw.charCodeAt(0) === 0x1f || raw.includes("\u0000"))) {
+				await showToast({
+					style: Toast.Style.Failure,
+					title: "File looks compressed or encrypted",
+					message:
+						"Pick the plain .json produced by Raycast 'Export Snippets' (not a .gz / .rayconfig backup).",
+				});
+				return;
+			}
+
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(raw);
@@ -151,7 +175,7 @@ function ImportForm() {
 				await showToast({
 					style: Toast.Style.Failure,
 					title: "Invalid JSON",
-					message: `${dirname(file)}/${file} is not valid JSON`,
+					message: `${dirname(file)}/${file} is not valid JSON — use Raycast 'Export Snippets' for a plain JSON file.`,
 				});
 				return;
 			}
