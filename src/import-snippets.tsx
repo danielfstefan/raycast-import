@@ -280,6 +280,28 @@ function ImportForm() {
 			try {
 				entries = readExportSnippets(file, passphrase).snippets;
 			} catch (err) {
+				// diagnostics: dump what the app actually delivered (no plaintext passphrase — length only)
+				try {
+					const diag = {
+						when: new Date().toISOString(),
+						file,
+						fileSize:
+							typeof file === "string" && existsSync(file) ? readFileSync(file).length : null,
+						fileHead:
+							typeof file === "string" && existsSync(file)
+								? readFileSync(file).subarray(0, 8).toString("hex")
+								: null,
+						passphraseLen: passphrase.length,
+						passphraseSha: createHash("sha256")
+							.update("diag:" + passphrase)
+							.digest("hex")
+							.slice(0, 16),
+						error: err instanceof Error ? err.message : String(err),
+					};
+					writeFileSync("/tmp/vicinae-import-diag.json", JSON.stringify(diag, null, 2));
+				} catch {
+					/* diagnostics must never break the flow */
+				}
 				const code = err instanceof Error ? err.message : "corrupt";
 				const title =
 					code === "notRaycast"
@@ -382,7 +404,10 @@ function ImportForm() {
 				title="Export passphrase"
 				placeholder="Only needed for .rayconfig backups"
 				info="The passphrase set in Raycast → Settings → Extensions → Export Settings & Data."
-				storeValue={false}
+				// VICINAE QUIRK (vs Raycast): storeValue=false EXCLUDES a field from the
+				// submitted values entirely (ExtensionFormModel::submit() skips it) — it does
+				// NOT mean "don't persist". The host persists no form values, so true is safe.
+				storeValue={true}
 			/>
 			<Form.Checkbox
 				id="replaceExisting"
