@@ -152,8 +152,35 @@ function findSnippetsInExport(root: unknown): { name: string; text: string; keyw
 	return out;
 }
 
+function findClipboardInExport(root: unknown): {
+	text: string;
+	category: string;
+	applicationPath?: string;
+}[] {
+	const obj = (root ?? {}) as Record<string, unknown>;
+	const ch = obj["builtin_package_clipboardHistory"] as
+		| { clipboardHistoryRecords?: unknown }
+		| undefined;
+	const raw = (typeof ch === "object" && ch && ch.clipboardHistoryRecords) || [];
+	const out: { text: string; category: string; applicationPath?: string }[] = [];
+	for (const item of raw as unknown[]) {
+		const e = (item ?? {}) as Record<string, unknown>;
+		const text = (e["text"] ?? "").toString();
+		if (!text) continue;
+		const category = (e["category"] ?? "text").toString();
+		const app = e["applicationPath"];
+		out.push({
+			text,
+			category,
+			...(typeof app === "string" && app ? { applicationPath: app } : {}),
+		});
+	}
+	return out;
+}
+
 function readExportSnippets(file: string, passphrase: string): {
 	snippets: { name: string; text: string; keyword?: string }[];
+	clipboard: { text: string; category: string; applicationPath?: string }[];
 } {
 	const buf = readFileSync(file);
 	const lower = file.toLowerCase();
@@ -169,7 +196,7 @@ function readExportSnippets(file: string, passphrase: string): {
 			const arr = Array.isArray(parsed)
 				? parsed
 				: (parsed as { snippets?: unknown }).snippets ?? [];
-			return { snippets: findSnippetsInExport(arr) };
+			return { snippets: findSnippetsInExport(arr), clipboard: [] };
 		} catch {
 			throw new Error("invalid-json");
 		}
@@ -180,11 +207,17 @@ function readExportSnippets(file: string, passphrase: string): {
 		// v2
 		const res = decryptV2(buf, passphrase);
 		if (!res.ok) throw new Error(res.error);
-		return { snippets: findSnippetsInExport(res.data) };
+		return {
+			snippets: findSnippetsInExport(res.data),
+			clipboard: findClipboardInExport(res.data),
+		};
 	}
 	const res = decryptV1(buf, passphrase);
 	if (!res.ok) throw new Error(res.error);
-	return { snippets: findSnippetsInExport(res.data) };
+	return {
+		snippets: findSnippetsInExport(res.data),
+		clipboard: findClipboardInExport(res.data),
+	};
 }
 
 // ---- Vicinae store helpers ----
@@ -251,6 +284,163 @@ function readExisting(): VicinaeSnippet[] {
 	}
 }
 
+// ---- Clipboard history import (v1: text + link records) ----
+
+type ClipboardRecord = { text: string; category: string; applicationPath?: string };
+
+type ClipboardImportResult =
+	| { status: "ok"; imported: number; skippedDupes: number; skippedImagesFiles: number; skippedEmpty: number }
+	| { status: "encrypted"; message: string }
+	| { status: "no-db" }
+	| { status: "no-sqlite" };
+
+const SQLITE_MAGIC = "SQLite format 3";
+
+function md5Hex(data: Buffer | string): string {
+	return createHash("md5").update(data).digest("hex");
+}
+
+// Node 22.5+ ships node:sqlite; the ext worker runs Node 22.23.1.
+// @ts-expect-error node:sqlite types may not exist on older @types/node
+function newClipboardDb(path: string) {
+	// eslint-disable-next-line @typescript-eslint/no-require-imports
+	const mod = require("node:sqlite") as { DatabaseSync: new (p: string) => SqliteDb };
+	return new mod.DatabaseSync(path);
+}
+
+interface SqliteDb {
+	exec(sql: string): void;
+	close(): void;
+	prepare(sql: string): {
+		run(...params: (string | number | null)[]): { changes?: number };
+		all(...params: (string | number | null)[]): Record<string, unknown>[];
+		get?(...params: unknown[]): Record<string, unknown> | undefined;
+	};
+}
+
+function clipboardDbPath(): string {
+	return join(dataDir(), "clipboard.db");
+}
+
+function clipboardDataDir(): string {
+	return join(dataDir(), "clipboard-data");
+}
+
+// uuid without braces/lowercase — matches QUuid::createUuid().toString(WithoutBraces)
+function clipUuid(): string {
+	const hex = "0123456789abcdef";
+	let out = "";
+	for (let i = 0; i < 32; i++) out += hex[Math.floor(Math.random() * 16)];
+	return out;
+}
+
+function importClipboardHistory(records: ClipboardRecord[]): ClipboardImportResult {
+	if (records.length === 0) return { status: "ok", imported: 0, skippedDupes: 0, skippedImagesFiles: 0, skippedEmpty: 0 };
+
+	const dbPath = clipboardDbPath();
+	if (!existsSync(dbPath)) return { status: "no-db" };
+
+	// SQLCipher-encrypted DBs don't start with the SQLite magic string.
+	const head = readFileSync(dbPath).subarray(0, 16).toString("utf8");
+	if (!head.startsWith(SQLITE_MAGIC)) {
+		return {
+			status: "encrypted",
+			message:
+				"Vicinae encrypts its clipboard database (SQLCipher). The importer can't write to an encrypted DB — disable 'Encrypt sensitive data' in Settings, restart Vicinae, re-import, then re-enable.",
+		};
+	}
+
+	let db: SqliteDb;
+	try {
+		db = newClipboardDb(dbPath);
+	} catch {
+		return { status: "no-sqlite" };
+	}
+
+	try {
+		db.exec("PRAGMA busy_timeout = 5000");
+		// dedupe against existing content (md5 hex, same as the core's content_hash_md5)
+		const existing = new Set<string>();
+		for (const row of db.prepare("SELECT content_hash_md5 FROM data_offer").all()) {
+			const h = row["content_hash_md5"];
+			if (typeof h === "string") existing.add(h);
+		}
+
+		const now = Math.floor(Date.now() / 1000);
+		const selStmt = db.prepare(
+			`INSERT INTO selection (id, hash_md5, preferred_mime_type, source, offer_count, created_at, updated_at, pinned_at, kind, keywords)
+			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		);
+		const offStmt = db.prepare(
+			`INSERT INTO data_offer (id, selection_id, mime_type, text_preview, content_hash_md5, size, encryption_type, kind, url_host)
+			 VALUES (?,?,?,?,?,?,?,?,?)`,
+		);
+
+		let imported = 0;
+		let skippedDupes = 0;
+		let skippedImagesFiles = 0;
+		let skippedEmpty = 0;
+
+		db.exec("BEGIN");
+		try {
+			for (const r of records) {
+				if (r.category !== "text" && r.category !== "link") {
+					skippedImagesFiles++;
+					continue;
+				}
+				const text = (r.text ?? "").toString();
+				if (!text) { skippedEmpty++; continue; }
+				const body = Buffer.from(text, "utf8");
+				const contentHash = md5Hex(body);
+				if (existing.has(contentHash)) { skippedDupes++; continue; }
+
+				const selectionId = clipUuid();
+				const offerId = clipUuid();
+				const isLink = r.category === "link";
+				const kind = isLink ? 2 : 1; // ClipboardOfferKind: Text=1, Link=2
+
+				selStmt.run(
+					selectionId,
+					contentHash,
+					"text/plain",
+					r.applicationPath ?? null,
+					1,
+					now,
+					now,
+					null,
+					kind,
+					"",
+				);
+				offStmt.run(
+					offerId,
+					selectionId,
+					"text/plain",
+					text.replace(/\s+/g, " ").trim().slice(0, 50),
+					contentHash,
+					body.length,
+					0, // EncryptionType::None
+					kind,
+					null,
+				);
+				// content file: <dataDir>/<offer.id>
+				mkdirSync(clipboardDataDir(), { recursive: true });
+				writeFileSync(join(clipboardDataDir(), offerId), body);
+
+				// FTS: tokenizer (fuzzy_trigram) is core-registered; a plain connection can't
+				// populate selection_fts, so imported entries browse but full-text search misses them.
+				existing.add(contentHash);
+				imported++;
+			}
+		} finally {
+			db.exec("COMMIT");
+		}
+
+		return { status: "ok", imported, skippedDupes, skippedImagesFiles, skippedEmpty };
+	} finally {
+		db.close();
+	}
+}
+
 // ---- UI ----
 
 function ImportForm() {
@@ -262,6 +452,7 @@ function ImportForm() {
 			? input.raycastFile[0]
 			: (input.raycastFile as string | undefined);
 		const replace = Boolean(input.replaceExisting);
+		const includeClipboard = Boolean(input.importClipboard);
 		const passphrase = String(input.passphrase ?? "");
 
 		setSubmitting(true);
@@ -277,8 +468,11 @@ function ImportForm() {
 			}
 
 			let entries: { name: string; text: string; keyword?: string }[];
+			let clipboard: ClipboardRecord[];
 			try {
-				entries = readExportSnippets(file, passphrase).snippets;
+				const parsed = readExportSnippets(file, passphrase);
+				entries = parsed.snippets;
+				clipboard = parsed.clipboard;
 			} catch (err) {
 				// diagnostics: dump what the app actually delivered (no plaintext passphrase — length only)
 				try {
@@ -357,12 +551,19 @@ function ImportForm() {
 			writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", "utf8");
 			renameSync(tmp, snippetsPath());
 
+			// clipboard history (only meaningful for .rayconfig backups)
+			let clipResult: ClipboardImportResult | null = null;
+			if (includeClipboard && clipboard.length > 0) {
+				clipResult = importClipboardHistory(clipboard);
+			}
+
 			push(
 				<ResultList
 					imported={imported}
 					skipped={skipped}
 					totalExported={entries.length}
 					replace={replace}
+					clipResult={clipResult}
 				/>,
 			);
 		} catch (err) {
@@ -421,6 +622,18 @@ function ImportForm() {
 					"After import: quit and reopen Vicinae for snippets to load (the core caches them in memory at startup)."
 				}
 			/>
+			<Form.Checkbox
+				id="importClipboard"
+				title="Import clipboard history"
+				label="Also import clipboard history from this backup (text + links)"
+				defaultValue={false}
+				storeValue={true}
+			/>
+			<Form.Description
+				text={
+					"Clipboard import is only available from a .rayconfig backup. Images and files aren't included (no body in the export). Requires the clipboard DB to be unencrypted — see the result list if it's not."
+				}
+			/>
 		</Form>
 	);
 }
@@ -430,12 +643,24 @@ function ResultList({
 	skipped,
 	totalExported,
 	replace,
+	clipResult,
 }: {
 	imported: VicinaeSnippet[];
 	skipped: string[];
 	totalExported: number;
 	replace: boolean;
+	clipResult: ClipboardImportResult | null;
 }) {
+	const clipNote =
+		clipResult && clipResult.status === "ok"
+			? `${clipResult.imported} clipboard entries imported${clipResult.skippedDupes ? `, ${clipResult.skippedDupes} duplicates skipped` : ""}${clipResult.skippedImagesFiles ? `, ${clipResult.skippedImagesFiles} image/file entries skipped` : ""}`
+			: clipResult?.status === "encrypted"
+				? "⚠️ Clipboard encrypted — see toast"
+				: clipResult?.status === "no-db"
+					? "Clipboard db not found"
+					: clipResult?.status === "no-sqlite"
+						? "node:sqlite unavailable"
+						: null;
 	return (
 		<List isLoading={false} navigationTitle="Import result">
 			<List.Section title="Imported" subtitle={`${imported.length} of ${totalExported} snippets`}>
@@ -468,12 +693,23 @@ function ResultList({
 					/>
 				)}
 			</List.Section>
+			{clipResult?.status === "encrypted" && (
+				<List.Section title="Clipboard">
+					<List.Item
+						title="Clipboard history already encrypted"
+						subtitle="Disable 'Encrypt sensitive data' in Settings, restart Vicinae, re-import, then re-enable."
+						icon={Icon.Shield}
+					/>
+				</List.Section>
+			)}
 			<List.Section
-				title="⚠️ Restart required"
+				title={clipNote ? "Clipboard" : "⚠️ Restart required"}
 				subtitle={
-					replace
-						? "Vicinae snippets were replaced. Quit and reopen Vicinae."
-						: "Quit and reopen Vicinae for the imported snippets to appear."
+					clipNote
+						? clipNote
+						: replace
+							? "Vicinae snippets were replaced. Quit and reopen Vicinae."
+							: "Quit and reopen Vicinae for the imported snippets to appear."
 				}
 			>
 				<List.Item
