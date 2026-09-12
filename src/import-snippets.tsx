@@ -91,7 +91,10 @@ function toVicinaeSnippet(
 	if (keyword && existingKeywords.has(keyword.toLowerCase()))
 		return { snippet: null, skippedReason: "keyword already in use in Vicinae" };
 
-	const id = `snp_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+	let id = `snp-${Math.random().toString(16).slice(2, 14)}`;
+	// core format: snp- + 12 lowercase hex; pad in case RNG yields short strings
+	while (id.length < 16) id += Math.floor(Math.random() * 16).toString(16);
+	id = id.slice(0, 16);
 
 	const snippet: VicinaeSnippet = {
 		id,
