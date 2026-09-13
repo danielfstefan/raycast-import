@@ -13,29 +13,24 @@ Import data exported from Raycast into Vicinae.
 - **Snippets:** converts Raycast snippets to Vicinae's native `SerializedSnippet` shape
   and merges into `<dataDir>/snippets/snippets.json`. Merge mode (default) or full
   replace (checkbox); duplicates skipped by name/keyword.
-- **Clipboard history** (`.rayconfig` only, checkbox): writes text + link entries from
-  `builtin_package_clipboardHistory` into Vicinae's clipboard SQLite store
-  (`selection` + `data_offer` + content files in `clipboard-data/<offerId>`), schema-verified
-  against the core's own migrations. Dedupes by content md5; images/files are skipped
-  (no body in the Raycast export). Runs in a transaction with `busy_timeout`.
+- **Clipboard history** (`.rayconfig` only, checkbox): replays text + link entries from
+  `builtin_package_clipboardHistory` through the app's **own clipboard recorder** —
+  `Clipboard.copy(text)` → macOS pasteboard → Vicinae's `poll()` observes it →
+  dedupe by content hash (`tryBubbleUpSelection`) → inserts into its SQLite store.
+  Because the app does the writing, **encryption is transparent** (no "disable
+  encrypt sensitive data" dance), and imported entries get full fuzzy-search
+  indexing. Runs at ~1.7 entries/sec (macOS clipboard poll tick = 500ms), with a
+  progress toast. Images/files are skipped (no body in the Raycast export).
 - Atomic write (tmp + rename) for the snippet store, with a `.bak-<ts>` backup of the
   previous store.
 
 ## Clipboard history & encryption
 
-Vicinae on macOS enables **"Encrypt sensitive data"** by default, which makes
-`clipboard.db` a SQLCipher-encrypted file. An extension can't write to an encrypted
-DB, so the importer **detects that state and reports it in-app** instead of corrupting
-your data (no silent downgrade of the security setting). To import clipboard history:
-
-1. Disable **Settings → Encrypt sensitive data**
-2. Quit and reopen Vicinae (the core migrates the DB to plaintext)
-3. Re-run the import with the clipboard checkbox on
-4. Re-enable **Encrypt sensitive data** and restart again
-
-If the DB is unencrypted (e.g. Linux, or the option was off), clipboard import just works.
-Imported text entries browse normally; full-text (fuzzy) search may not match them because
-the trigram tokenizer is registered by the core, not loadable from Node — a known v1 limit.
+Vicinae on macOS enables **"Encrypt sensitive data"** by default, making `clipboard.db`
+SQLCipher-encrypted. That does **not** block this import: the importer copies each
+entry onto the system clipboard and lets **Vicinae itself** observe and record it
+(the app holds the decryption key in-process). No settings changes needed, and
+imported entries end up just as searchable as clipboard entries you copy yourself.
 
 ## Why the `.rayconfig` passphrase
 
