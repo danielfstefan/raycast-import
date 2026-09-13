@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import {
 	readFileSync,
@@ -6,6 +6,7 @@ import {
 	renameSync,
 	existsSync,
 	mkdirSync,
+	rmSync,
 } from "node:fs";
 import { createDecipheriv, scryptSync, createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
@@ -18,6 +19,8 @@ import {
 	Icon,
 	List,
 	Toast,
+	launchCommand,
+	LaunchType,
 	showToast,
 	useNavigation,
 } from "@vicinae/api";
@@ -713,26 +716,68 @@ function ImportForm() {
 			writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", "utf8");
 			renameSync(tmp, snippetsPath());
 
-			// clipboard history (only meaningful for .rayconfig backups)
-			let clipResult: ClipboardImportResult | null = null;
-			if (includeClipboard && clipboard.length > 0) {
-				clipResult = await importClipboardHistory(clipboard);
-			}
-
 			// emoji metadata (frecency + custom keywords) — safe atomic merge
 			const includeEmoji = Boolean(input.importEmoji);
 			const emojiImported = includeEmoji ? importEmojiMetadata(emojis) : 0;
 
-			push(
-				<ResultList
-					imported={imported}
-					skipped={skipped}
-					totalExported={entries.length}
-					replace={replace}
-					clipResult={clipResult}
-					emojiImported={emojiImported}
-				/>,
-			);
+			// clipboard history (only meaningful for .rayconfig backups)
+			// Runs in a HEADLESS no-view command (import-clipboard) so the loop
+			// survives window dismissal — a view command's worker dies with its
+			// CommandFrame (~CommandFrame → context->unload(), navigation-controller).
+			// The decrypted entries go to a 0600 temp JSON file; only its PATH rides
+			// launchContext (in-memory) — the passphrase never leaves this worker.
+			// Dedup bubbling in the recorder makes re-runs idempotent: entries that
+			// were already imported just bubble to the top, they never duplicate.
+			let clipResult: ClipboardImportResult | null = null;
+			let launched = false;
+			if (includeClipboard && clipboard.length > 0) {
+				const tmpClip = join(tmpdir(), `raycast-import-clip-${at}.json`);
+				try {
+					writeFileSync(tmpClip, JSON.stringify(clipboard), { mode: 0o600 });
+					await showToast({
+						style: Toast.Style.Success,
+						title: "Clipboard import running in the background",
+						message: `${clipboard.length} entries — progress shows as toasts; closing this window is safe.`,
+					});
+					// control transfers here: on success this command is unloaded
+					await launchCommand({
+						name: "import-clipboard",
+						type: LaunchType.UserInitiated,
+						context: { file: tmpClip },
+					});
+					launched = true;
+				} catch (err) {
+					rmSync(tmpClip, { force: true });
+					await showToast({
+						style: Toast.Style.Failure,
+						title: "Background import unavailable — importing inline instead",
+						message: err instanceof Error ? err.message : String(err),
+					});
+					clipResult = await importClipboardHistory(clipboard);
+				}
+			} else if (includeClipboard) {
+				clipResult = {
+					status: "ok",
+					imported: 0,
+					skippedDupes: 0,
+					skippedImagesFiles: 0,
+					skippedEmpty: 0,
+					errors: [],
+				};
+			}
+
+			if (!launched) {
+				push(
+					<ResultList
+						imported={imported}
+						skipped={skipped}
+						totalExported={entries.length}
+						replace={replace}
+						clipResult={clipResult}
+						emojiImported={emojiImported}
+					/>,
+				);
+			}
 		} catch (err) {
 			await showToast({
 				style: Toast.Style.Failure,

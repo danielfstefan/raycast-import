@@ -15,6 +15,12 @@
 			"title": "Import Raycast Data",
 			"description": "Import snippets, clipboard history, and emoji history from a Raycast export (.json or encrypted .rayconfig)",
 			"mode": "view"
+		},
+		{
+			"name": "import-clipboard",
+			"title": "Import Clipboard History (background)",
+			"description": "Headless helper: replays the decrypted clipboard history through Vicinae's own recorder. Launched automatically by 'Import Raycast Data' — no need to run this directly.",
+			"mode": "no-view"
 		}
 	],
 	"preferences": [],
