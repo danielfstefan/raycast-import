@@ -643,8 +643,62 @@ async function importExtensionsInline(picks: { name: string; author: string }[])
 // ---- UI ----
 
 function ImportForm() {
-	const { push } = useNavigation();
+	const { push, pop } = useNavigation();
 	const [submitting, setSubmitting] = useState(false);
+	// Controlled form values (so the "Choose extensions…" button can act on the
+	// currently-typed file + passphrase without a submit).
+	const [extFile, setExtFile] = useState<string | undefined>();
+	const [extPass, setExtPass] = useState<string>("");
+	// Extensions the user picked in the picker (null = never picked → default all).
+	const [pickedExtensions, setPickedExtensions] = useState<{ name: string; author: string }[] | null>(null);
+
+	async function chooseExtensions(filePath: string | undefined, passphrase: string) {
+		if (!filePath) {
+			await showToast({
+				style: Toast.Style.Failure,
+				title: "Pick a file first",
+				message: "Select your Raycast export above, then choose extensions.",
+			});
+			return;
+		}
+		let parsed;
+		try {
+			parsed = readExportSnippets(filePath, passphrase);
+		} catch (err) {
+			const code = err instanceof Error ? err.message : "corrupt";
+			await showToast({
+				style: Toast.Style.Failure,
+				title: code === "passphrase" ? "Incorrect passphrase" : "Can't read export",
+				message:
+					code === "passphrase"
+						? "Enter the passphrase you set in Raycast → Settings → Extensions → Export Settings & Data."
+						: code === "notRaycast"
+							? "This doesn't look like a Raycast export."
+							: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+		if (parsed.extensions.length === 0) {
+			await showToast({
+				style: Toast.Style.Failure,
+				title: "No extensions in this export",
+				message: "Extensions are only included in a .rayconfig backup (not plain .json).",
+			});
+			return;
+		}
+		push(
+			<ExtensionPicker
+				extensions={parsed.extensions}
+				initialSelected={new Set(
+					(pickedExtensions ?? parsed.extensions).map((e) => e.name),
+				)}
+				onDone={(picks) => {
+					setPickedExtensions(picks);
+					pop();
+				}}
+			/>,
+		);
+	}
 
 	async function onSubmit(input: Form.Values) {
 		const file = Array.isArray(input.raycastFile)
@@ -747,6 +801,13 @@ function ImportForm() {
 			// The worker deletes the dir on every exit path and a stale sweep
 			// clears leftovers from interrupted runs (SECURITY-003).
 			const clipAvailable = includeClipboard && clipboard.length > 0;
+			// If the user picked extensions (Choose extensions… button), use that
+			// exact set; if they didn't pick but enabled the checkbox, default to
+			// ALL extensions in the export.
+			const extPick =
+				pickedExtensions !== null
+					? pickedExtensions
+					: extensions.map((e) => ({ name: e.name, author: e.author }));
 			const extsAvailable = includeExtensions && extensions.length > 0;
 
 			// helper: write encrypted payload + hand off to the background worker,
@@ -789,18 +850,11 @@ function ImportForm() {
 				}
 			};
 
-			if (extsAvailable) {
-				// let the user pick which extensions (default all) — then one
-				// handoff carries BOTH clipboard + extension list together
-				push(
-					<ExtensionPicker
-						extensions={extensions}
-						clipboard={clipAvailable ? clipboard : undefined}
-						runBackground={runBackground}
-					/>,
-				);
-			} else if (clipAvailable) {
-				await runBackground({ clipboard });
+			if (extsAvailable || clipAvailable) {
+				await runBackground({
+					...(clipAvailable ? { clipboard } : {}),
+					...(extsAvailable ? { extensions: extPick } : {}),
+				});
 			} else {
 				push(
 					<ResultList
@@ -830,6 +884,12 @@ function ImportForm() {
 			actions={
 				<ActionPanel>
 					<Action.SubmitForm title="Import" icon={Icon.Download} onSubmit={onSubmit} />
+					<Action
+						title="Choose extensions…"
+						icon={Icon.CheckList}
+						onAction={() => chooseExtensions(extFile, extPass)}
+						shortcut={{ modifiers: ["cmd"], key: "e" }}
+					/>
 				</ActionPanel>
 			}
 		>
@@ -846,6 +906,11 @@ function ImportForm() {
 				canChooseDirectories={false}
 				allowMultipleSelection={false}
 				storeValue={true}
+				value={extFile}
+				onChange={(v) => {
+					if (Array.isArray(v)) setExtFile(v[0]);
+					else setExtFile(v);
+				}}
 			/>
 			<Form.PasswordField
 				id="passphrase"
@@ -856,6 +921,8 @@ function ImportForm() {
 				// submitted values entirely (ExtensionFormModel::submit() skips it) — it does
 				// NOT mean "don't persist". The host persists no form values, so true is safe.
 				storeValue={true}
+				value={extPass}
+				onChange={setExtPass}
 			/>
 			<Form.Checkbox
 				id="replaceExisting"
@@ -896,13 +963,15 @@ function ImportForm() {
 			<Form.Checkbox
 				id="importExtensions"
 				title="Import Raycast extensions"
-				label="Also reinstall your installed Raycast extensions (from this backup — .rayconfig only)"
-				defaultValue={false}
+				label="Reinstall your installed Raycast extensions (from this backup — .rayconfig only)"
+				defaultValue={pickedExtensions !== null}
 				storeValue={true}
 			/>
 			<Form.Description
 				text={
-					"Extension import lets you pick which of the extensions in this backup to install (all are pre-selected) — each is downloaded from the official Raycast store and installed into Vicinae's extension folder, live-registered (no restart). Already-installed ones are skipped."
+					pickedExtensions !== null
+						? `✅ ${pickedExtensions.length} extension${pickedExtensions.length === 1 ? "" : "s"} chosen — press "Choose extensions…" (⌘E) to change the selection.`
+						: 'Press "Choose extensions…" (⌘E) to pick which extensions to install (all are pre-selected). Already-installed ones are skipped. Only available from a .rayconfig backup.'
 				}
 			/>
 		</Form>
@@ -911,15 +980,14 @@ function ImportForm() {
 
 function ExtensionPicker({
 	extensions,
-	clipboard,
-	runBackground,
+	initialSelected,
+	onDone,
 }: {
 	extensions: RaycastNodeExtension[];
-	clipboard?: ClipboardRecord[];
-	runBackground: (payload: { clipboard?: ClipboardRecord[]; extensions?: { name: string; author: string }[] }) => Promise<void>;
+	initialSelected: Set<string>;
+	onDone: (picks: { name: string; author: string }[]) => void;
 }) {
-	// default: everything selected (install all)
-	const [selected, setSelected] = useState<Set<string>>(() => new Set(extensions.map((e) => e.name)));
+	const [selected, setSelected] = useState<Set<string>>(() => new Set(initialSelected));
 
 	const toggle = (name: string) => {
 		setSelected((prev) => {
@@ -936,25 +1004,15 @@ function ExtensionPicker({
 
 	const picked = extensions.filter((e) => selected.has(e.name)).map((e) => ({ name: e.name, author: e.author }));
 
-	const install = async () => {
-		if (picked.length === 0) {
-			await showToast({
-				style: Toast.Style.Failure,
-				title: "No extensions selected",
-				message: "Toggle at least one extension on, then install.",
-			});
-			return;
-		}
-		await runBackground({ ...(clipboard && clipboard.length > 0 ? { clipboard } : {}), extensions: picked });
-	};
+	const done = () => onDone(picked);
 
 	return (
 		<List
-			navigationTitle="Select Raycast extensions"
+			navigationTitle="Choose Raycast extensions"
 			searchBarPlaceholder={`Search ${extensions.length} extensions…`}
 			actions={
 				<ActionPanel>
-					<Action title={`Install ${count} selected`} icon={Icon.Download} onAction={install} />
+					<Action title={`Use ${count} selected`} icon={Icon.Checkmark} onAction={done} />
 					<Action title="Select all" icon={Icon.CheckCircle} onAction={selectAll} shortcut={{ modifiers: ["cmd"], key: "a" }} />
 					<Action title="Deselect all" icon={Icon.Circle} onAction={deselectAll} shortcut={{ modifiers: ["cmd", "shift"], key: "a" }} />
 				</ActionPanel>
@@ -972,10 +1030,10 @@ function ExtensionPicker({
 							accessories={on ? [{ icon: Icon.Checkmark }] : []}
 							actions={
 								<ActionPanel>
-									{/* Install is the PRIMARY action (Enter) on every item — this is
-									    the path forward from the picker, not the list-level actions
-									    (which only render in the empty-search state). */}
-									<Action title={`Install ${count} selected`} icon={Icon.Download} onAction={install} />
+									{/* "Use N selected" is the PRIMARY action (Enter) on every item —
+									    the path forward from the picker. List-level actions only
+									    render in the empty-search state. */}
+									<Action title={`Use ${count} selected`} icon={Icon.Checkmark} onAction={done} />
 									<Action
 										title={on ? "Deselect" : "Select"}
 										icon={on ? Icon.Checkmark : Icon.Circle}
