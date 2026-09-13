@@ -909,11 +909,11 @@ function ImportForm() {
 				canChooseDirectories={false}
 				allowMultipleSelection={false}
 				storeValue={true}
-				value={extFile}
-				onChange={(v) => {
-					if (Array.isArray(v)) setExtFile(v[0]);
-					else setExtFile(v);
-				}}
+				// NOTE: deliberately UNCONTROLLED (no value prop) — the RDK renders the
+				// native picker's own filename display, which breaks if we force `value`.
+				// We only subscribe to onChange to keep our state in sync for the
+				// "Choose extensions…" button / auto-open flow.
+				onChange={(v) => setExtFile(Array.isArray(v) ? (v[0] ?? undefined) : v)}
 			/>
 			<Form.PasswordField
 				id="passphrase"
@@ -924,7 +924,7 @@ function ImportForm() {
 				// submitted values entirely (ExtensionFormModel::submit() skips it) — it does
 				// NOT mean "don't persist". The host persists no form values, so true is safe.
 				storeValue={true}
-				value={extPass}
+				// UNCONTROLLED too (no value prop) for same reason as FilePicker.
 				onChange={setExtPass}
 			/>
 			<Form.Checkbox
@@ -969,12 +969,22 @@ function ImportForm() {
 				label="Reinstall your installed Raycast extensions (from this backup — .rayconfig only)"
 				defaultValue={pickedExtensions !== null}
 				storeValue={true}
+				// Toggling the checkbox ON opens the picker immediately (so the
+				// option can't be missed); toggling OFF clears any picked selection.
+				onChange={(checked) => {
+					if (checked) {
+						setPickedExtensions(null);
+						chooseExtensions(extFile, extPass);
+					} else {
+						setPickedExtensions(null);
+					}
+				}}
 			/>
 			<Form.Description
 				text={
 					pickedExtensions !== null
-						? `✅ ${pickedExtensions.length} extension${pickedExtensions.length === 1 ? "" : "s"} chosen — press "Choose extensions…" (⌘E) to change the selection.`
-						: 'Press "Choose extensions…" (⌘E) to pick which extensions to install (all are pre-selected). Already-installed ones are skipped. Only available from a .rayconfig backup.'
+						? `✅ ${pickedExtensions.length} extension${pickedExtensions.length === 1 ? "" : "s"} chosen — toggle the box off to skip, or press "Choose extensions…" (⌘E) to change the selection.`
+						: 'Tick the box above to import extensions (the picker opens automatically) — or press "Choose extensions…" (⌘E) any time. All are pre-selected; already-installed ones are skipped. Only available from a .rayconfig backup.'
 				}
 			/>
 		</Form>
