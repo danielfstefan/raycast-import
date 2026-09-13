@@ -30,10 +30,14 @@ import {
 
 // ---- Raycast .rayconfig formats (reverse-engineered by Tinycast, verified live here) ----
 // v1 (Raycast 1.x):   file = IV(16) || AES-256-CBC( gzip(JSON), PKCS#7 ), key = SHA-256(passphrase)
-// v2 (Raycast X):     file = gzip -> JSON envelope {data, encryption:{iv,salt,authTag}} -> AES-256-GCM
-//                      key = scrypt(passphrase, salt, N=16384, r=8, p=1, dkLen=32)
-// Detection: leading gzip magic (1f 8b 08) => v2, else v1 (whole AES blocks).
-// Snippets live at JSON.builtin_package_snippets.snippets as [{name, text, alias, ...}].
+// v2 (schemaVersion 3, RAYCFG3): "RAYCFG3\n" + u32le gzipLen + gzip(envelope JSON
+//                      {exportedAt, appVersion, encryption:{iv,salt}, schemaVersion}) +
+//                      AES-256-GCM payload (16B tag appended). Key = scrypt(passphrase,
+//                      salt, N=16384, r=8, p=1, dkLen=32). GCM plaintext = gzip of big JSON.
+// Detection: leading "RAYC\0" magic => RAYCFG3 v2; leading gzip magic (1f 8b 08) => legacy v2
+//            envelope; else v1 (whole AES blocks).
+// Data lives at root.snippets.snippets (v2, {title, rawContent}) / root.quicklinks.quicklinks /
+// root.clipboardHistory.clipboardEntries (v2, items[].representations[].content) etc.
 
 interface VicinaeSnippet {
 	id: string;
@@ -82,8 +86,45 @@ function decryptV1(raw: Buffer, passphrase: string): DecryptResult {
 	}
 }
 
-function decryptV2(raw: Buffer, passphrase: string): DecryptResult {
+function decryptV2(
+	raw: Buffer,
+	passphrase: string,
+	isRaycfg3: boolean,
+): DecryptResult {
 	try {
+		// Real v2 (schemaVersion 3, Tinycast-compatible):
+		//   "RAYCFG3\n" (8B) + u32 little-endian gzipLen + gzip(envelope JSON
+		//   {exportedAt, appVersion, encryption:{iv, salt}, schemaVersion:3})
+		//   + AES-256-GCM payload (16B auth tag appended to ciphertext).
+		//   Key = scrypt(passphrase, salt, 32, N=16384, r=8, p=1).
+		//   GCM plaintext = another gzip stream of the big JSON export.
+		if (isRaycfg3) {
+			if (raw.length < 12) return { ok: false, error: "corrupt" };
+			const envLen = raw.readUInt32LE(8);
+			if (envLen <= 0 || 12 + envLen > raw.length)
+				return { ok: false, error: "corrupt" };
+			const envRaw = gunzipSync(raw.subarray(12, 12 + envLen));
+			const env = JSON.parse(envRaw.toString("utf8")) as Record<string, unknown>;
+			const enc = env["encryption"] as Record<string, string> | undefined;
+			if (!enc || typeof enc["iv"] !== "string" || typeof enc["salt"] !== "string")
+				return { ok: false, error: "notRaycast" };
+			const iv = Buffer.from(enc["iv"], "hex");
+			const salt = Buffer.from(enc["salt"], "hex");
+			const payload = raw.subarray(12 + envLen);
+			if (payload.length <= 16) return { ok: false, error: "corrupt" };
+			const tag = payload.subarray(payload.length - 16);
+			const ct = payload.subarray(0, payload.length - 16);
+			const key = scryptSync(passphrase, salt, 32, { N: 16384, r: 8, p: 1 });
+			const decipher = createDecipheriv("aes-256-gcm", key, iv);
+			decipher.setAuthTag(tag);
+			const finish: () => Buffer = decipher.final
+				? () => decipher.final()
+				: () => (decipher as unknown as { finalize: () => Buffer }).finalize();
+			const plain = Buffer.concat([decipher.update(ct), finish()]);
+			return parseVicinaeJson(gunzipSync(plain));
+		}
+
+		// legacy v2: gzip -> JSON envelope {data, encryption:{iv,salt,authTag}} -> AES-256-GCM
 		let env: Record<string, unknown>;
 		try {
 			env = JSON.parse(gunzipSync(raw).toString("utf8")) as Record<string, unknown>;
@@ -123,10 +164,14 @@ function parseVicinaeJson(plain: Buffer): DecryptResult {
 	}
 }
 
-function findSnippetsInExport(root: unknown): { name: string; text: string; keyword?: string }[] {
+type RaycastEmoji = { symbol?: unknown; customKeywords?: unknown; frecencyDate?: unknown };
+
+function findSnippetsInExport(
+	root: unknown,
+): { name: string; text: string; keyword?: string }[] {
+	const out: { name: string; text: string; keyword?: string }[] = [];
 	// plain "Export Snippets" JSON is a top-level array
 	if (Array.isArray(root)) {
-		const out: { name: string; text: string; keyword?: string }[] = [];
 		for (const item of root) {
 			const e = (item ?? {}) as Record<string, unknown>;
 			const name = (e["name"] ?? "").toString().trim();
@@ -139,18 +184,44 @@ function findSnippetsInExport(root: unknown): { name: string; text: string; keyw
 	}
 	const obj = (root ?? {}) as Record<string, unknown>;
 	const pkgs = obj["builtin_package_snippets"] as Record<string, unknown> | undefined;
-	const raw = (typeof pkgs === "object" && pkgs && (pkgs["snippets"] as unknown[] | undefined)) ||
-		(obj["snippets"] as unknown[] | undefined) || [];
-	const out: { name: string; text: string; keyword?: string }[] = [];
+	const v1Raw = (typeof pkgs === "object" && pkgs && (pkgs["snippets"] as unknown[] | undefined)) || [];
+	const v2Raw = (obj["snippets"] as Record<string, unknown> | undefined)?.["snippets"] as
+		| unknown[]
+		| undefined;
+	const raw = (v2Raw ?? v1Raw) as unknown[];
 	for (const item of raw) {
 		const e = (item ?? {}) as Record<string, unknown>;
-		const name = (e["name"] ?? "").toString().trim();
-		const text = (e["text"] ?? "").toString();
-		if (!name || !text) continue;
+		// v1: { name, text, alias }; v2: { title, text/rawContent, tags }
+		const name = (e["name"] ?? e["title"] ?? "").toString().trim();
+		if (!name) continue;
+		// v2 rich text lives in rawContent.content[n].content[m].text — fall back to .text
+		let text = (e["text"] ?? "").toString();
+		if (!text) text = extractRichText(e["rawContent"]);
+		if (!text) continue;
 		const keyword = (e["keyword"] ?? e["alias"] ?? "").toString().trim();
 		out.push({ name, text, keyword: keyword || undefined });
 	}
 	return out;
+}
+
+// Tinycast/Raycast rich-text doc: rawContent.content[] -> content[] -> { text }
+function extractRichText(raw: unknown): string {
+	if (!raw || typeof raw !== "object") return "";
+	const parts: string[] = [];
+	const walk = (node: Record<string, unknown> | unknown[], depth: number) => {
+		if (depth > 16) return;
+		if (Array.isArray(node)) {
+			for (const el of node) if (el && typeof el === "object") walk(el as Record<string, unknown>, depth + 1);
+			return;
+		}
+		const n = node as Record<string, unknown>;
+		if (typeof n["text"] === "string") parts.push(n["text"] as string);
+		const content = n["content"];
+		if (Array.isArray(content)) walk(content, depth + 1);
+		else if (content && typeof content === "object") walk(content as Record<string, unknown>, depth + 1);
+	};
+	walk(raw as Record<string, unknown>, 0);
+	return parts.join("\n");
 }
 
 function findClipboardInExport(root: unknown): {
@@ -159,29 +230,82 @@ function findClipboardInExport(root: unknown): {
 	applicationPath?: string;
 }[] {
 	const obj = (root ?? {}) as Record<string, unknown>;
-	const ch = obj["builtin_package_clipboardHistory"] as
+	const v1ch = obj["builtin_package_clipboardHistory"] as
 		| { clipboardHistoryRecords?: unknown }
 		| undefined;
-	const raw = (typeof ch === "object" && ch && ch.clipboardHistoryRecords) || [];
+	const v2ch = obj["clipboardHistory"] as
+		| { clipboardEntries?: unknown }
+		| undefined;
+	const dots = root && typeof root === "object" && (root as { dots?: unknown }).dots;
 	const out: { text: string; category: string; applicationPath?: string }[] = [];
-	for (const item of raw as unknown[]) {
+
+	// v1 records: [{ text, category, applicationPath }]
+	if (typeof v1ch === "object" && v1ch && v1ch.clipboardHistoryRecords) {
+		for (const item of v1ch.clipboardHistoryRecords as unknown[]) {
+			const e = (item ?? {}) as Record<string, unknown>;
+			const text = (e["text"] ?? "").toString();
+			if (!text) continue;
+			const category = (e["category"] ?? "text").toString();
+			const app = e["applicationPath"];
+			out.push({
+				text,
+				category,
+				...(typeof app === "string" && app ? { applicationPath: app } : {}),
+			});
+		}
+		return out;
+	}
+
+	// v2 entries: [{ title, items: [{ representations: [{ content, contentType }] }], categories: [] }]
+	const entries =
+		(typeof v2ch === "object" && v2ch && v2ch.clipboardEntries) ||
+		(typeof dots === "object" && (dots as { entries?: unknown }).entries &&
+			(dots as { entries: unknown }).entries);
+	for (const item of (entries as unknown[]) ?? []) {
 		const e = (item ?? {}) as Record<string, unknown>;
-		const text = (e["text"] ?? "").toString();
+		const items = Array.isArray(e["items"]) ? (e["items"] as Record<string, unknown>[]) : [];
+		let text = "";
+		let category = "text";
+		for (const repGroup of items) {
+			const reps = Array.isArray(repGroup["representations"])
+				? (repGroup["representations"] as Record<string, unknown>[])
+				: [];
+			for (const r of reps) {
+				const contentType = (r["contentType"] ?? "").toString();
+				if (contentType && contentType !== "text") continue;
+				const content = (r["content"] ?? "").toString();
+				if (content) {
+					text = content;
+					if (contentType) category = contentType;
+					break;
+				}
+			}
+			if (text) break;
+		}
+		if (!text) text = (e["title"] ?? "").toString();
 		if (!text) continue;
-		const category = (e["category"] ?? "text").toString();
-		const app = e["applicationPath"];
-		out.push({
-			text,
-			category,
-			...(typeof app === "string" && app ? { applicationPath: app } : {}),
-		});
+		category = Array.isArray(e["categories"]) && (e["categories"] as string[])[0]
+			? (e["categories"] as string[])[0]
+			: category;
+		out.push({ text, category });
 	}
 	return out;
+}
+
+function findEmojiInExport(root: unknown): RaycastEmoji[] {
+	const obj = (root ?? {}) as Record<string, unknown>;
+	const pkg = obj["builtin_package_emoji"] as Record<string, unknown> | undefined;
+	const v1Raw = (typeof pkg === "object" && pkg && (pkg["emojis"] as unknown[] | undefined)) || [];
+	const v2Raw = (obj["emoji"] as Record<string, unknown> | undefined)?.["emojis"] as
+		| unknown[]
+		| undefined;
+	return ((v2Raw ?? v1Raw) as unknown[]).map((item) => item as RaycastEmoji);
 }
 
 function readExportSnippets(file: string, passphrase: string): {
 	snippets: { name: string; text: string; keyword?: string }[];
 	clipboard: { text: string; category: string; applicationPath?: string }[];
+	emoji: RaycastEmoji[];
 } {
 	const buf = readFileSync(file);
 	const lower = file.toLowerCase();
@@ -197,20 +321,24 @@ function readExportSnippets(file: string, passphrase: string): {
 			const arr = Array.isArray(parsed)
 				? parsed
 				: (parsed as { snippets?: unknown }).snippets ?? [];
-			return { snippets: findSnippetsInExport(arr), clipboard: [] };
+			return { snippets: findSnippetsInExport(arr), clipboard: [], emoji: [] };
 		} catch {
 			throw new Error("invalid-json");
 		}
 	}
 
 	// encrypted .rayconfig
-	if (buf[0] === 0x1f && buf[1] === 0x8b && buf[2] === 0x08) {
-		// v2
-		const res = decryptV2(buf, passphrase);
+	if (
+		(buf[0] === 0x1f && buf[1] === 0x8b && buf[2] === 0x08) ||
+		(buf[0] === 0x52 && buf[1] === 0x41 && buf[2] === 0x59 && buf[3] === 0x43) // "RAYC"
+	) {
+		// v2 — either legacy gz-json envelope or RAYCFG3 binary envelope
+		const res = decryptV2(buf, passphrase, buf[0] === 0x52);
 		if (!res.ok) throw new Error(res.error);
 		return {
 			snippets: findSnippetsInExport(res.data),
 			clipboard: findClipboardInExport(res.data),
+			emoji: findEmojiInExport(res.data),
 		};
 	}
 	const res = decryptV1(buf, passphrase);
@@ -218,7 +346,21 @@ function readExportSnippets(file: string, passphrase: string): {
 	return {
 		snippets: findSnippetsInExport(res.data),
 		clipboard: findClipboardInExport(res.data),
+		emoji: findEmojiInExport(res.data),
 	};
+}
+
+// ---- Vicinae emoji metadata store (GlyphService, verified) ----
+// [{ emoji, visitCount, pinnedAt?, lastVisitedAt?, skinTone?, keyword? }]
+interface VicinaeEmojiMeta {
+	emoji: string;
+	visitCount: number;
+	lastVisitedAt?: number;
+	keyword?: string;
+}
+
+function emojisPath(): string {
+	return join(dataDir(), "emojis", "emojis.json");
 }
 
 // ---- Vicinae store helpers ----
@@ -285,6 +427,69 @@ function readExisting(): VicinaeSnippet[] {
 	}
 }
 
+// ---- Emoji metadata import (GlyphService store, verified) ----
+// Raycast v2 emits [{ symbol, customKeywords[], frecencyDate }]. Vicinae stores
+// per-glyph METADATA (the glyph table itself is static, generated into
+// glyph.cpp): [{ emoji, visitCount, pinnedAt?, lastVisitedAt?, skinTone?, keyword? }].
+// Safe merge: bump visitCount (frecency), set keyword (customKeywords joined),
+// never clobber pinnedAt/skinTone. Atomic write with timestamp backup, like snippets.
+
+function readExistingEmoji(): VicinaeEmojiMeta[] {
+	const p = emojisPath();
+	if (!existsSync(p)) return [];
+	try {
+		const raw = JSON.parse(readFileSync(p, "utf8"));
+		return Array.isArray(raw) ? (raw as VicinaeEmojiMeta[]) : [];
+	} catch {
+		return [];
+	}
+}
+
+function importEmojiMetadata(emojis: RaycastEmoji[]): number {
+	if (emojis.length === 0) return 0;
+	const existing = readExistingEmoji();
+	const bySymbol = new Map(existing.map((e) => [e.emoji, e]));
+	let merged = 0;
+	const at = nowSeconds();
+	for (const item of emojis) {
+		const symbol = (item.symbol ?? "").toString().trim();
+		if (!symbol) continue;
+		const freq = Number(item.frecencyDate);
+		const keywords = Array.isArray(item.customKeywords)
+			? (item.customKeywords as unknown[])
+					.map((k) => (k ?? "").toString().trim())
+					.filter(Boolean)
+			: [];
+		let entry = bySymbol.get(symbol);
+		if (entry) {
+			// merge into existing metadata
+			if (Number.isFinite(freq) && freq > 0) {
+				entry.visitCount = Math.max(entry.visitCount ?? 0, Math.round(freq) || 1);
+				entry.lastVisitedAt = at;
+			}
+			if (keywords.length > 0 && !entry.keyword)
+				entry.keyword = keywords.join(" ");
+		} else {
+			entry = {
+				emoji: symbol,
+				visitCount: Number.isFinite(freq) && freq > 0 ? Math.round(freq) || 1 : 1,
+				...(Number.isFinite(freq) && freq > 0 ? { lastVisitedAt: at } : {}),
+				...(keywords.length > 0 ? { keyword: keywords.join(" ") } : {}),
+			};
+			bySymbol.set(symbol, entry);
+			merged++;
+		}
+	}
+	const all = [...bySymbol.values()];
+	if (!existsSync(emojisPath())) mkdirSync(dirname(emojisPath()), { recursive: true });
+	const b = `${emojisPath()}.bak-${nowSeconds()}`;
+	if (existsSync(emojisPath())) renameSync(emojisPath(), b);
+	const tmp = `${emojisPath()}.tmp-${nowSeconds()}`;
+	writeFileSync(tmp, JSON.stringify(all, null, 2), "utf8");
+	renameSync(tmp, emojisPath());
+	return merged;
+}
+
 // ---- Clipboard history import ----
 //
 // Design (verified in host source): we do NOT write Vicinae's clipboard SQLite
@@ -303,7 +508,14 @@ function readExisting(): VicinaeSnippet[] {
 type ClipboardRecord = { text: string; category: string; applicationPath?: string };
 
 type ClipboardImportResult =
-	| { status: "ok"; imported: number; skippedDupes: number; skippedImagesFiles: number; skippedEmpty: number }
+	| {
+			status: "ok";
+			imported: number;
+			skippedDupes: number;
+			skippedImagesFiles: number;
+			skippedEmpty: number;
+			errors: { byteLen: number; error: string }[];
+	  }
 	| { status: "no-records" };
 
 const CLIPBOARD_COPY_INTERVAL_MS = 600;
@@ -319,6 +531,7 @@ async function importClipboardHistory(records: ClipboardRecord[]): Promise<Clipb
 	let skippedDupes = 0;
 	let skippedImagesFiles = 0;
 	let skippedEmpty = 0;
+	let clipboardErrors: { byteLen: number; error: string }[] | null = null;
 
 	let toast: Toast | null = null;
 	try {
@@ -346,27 +559,46 @@ async function importClipboardHistory(records: ClipboardRecord[]): Promise<Clipb
 		}
 		// concealed=false (default): the copy is observed and recorded into history.
 		// Re-copying identical text bubbles to the top instead of duplicating.
-		await Clipboard.copy(text);
+		// One failed copy must NEVER kill the whole import: catch per record,
+		// remember the failure, keep streaming, report at the end.
+		try {
+			await Clipboard.copy(text);
+			imported++;
+		} catch (err) {
+			if (!clipboardErrors) clipboardErrors = [];
+			clipboardErrors.push({
+				byteLen: Buffer.byteLength(text, "utf8"),
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 		// one pasteboard change per poll tick (500ms) — leave margin
 		await sleep(CLIPBOARD_COPY_INTERVAL_MS);
-		imported++;
 
 		// throttle toast updates to ~2/sec
 		const now = Date.now();
 		if (toast && now - lastReport > 500) {
 			lastReport = now;
 			const pct = Math.round((imported / total) * 100);
-			toast.message = `${pct}% — ${imported}/${total} (runs at ~1.7/sec)`;
+			toast.message = `${pct}% — ${imported}/${total} copied, ${clipboardErrors ? clipboardErrors.length : 0} failed (runs at ~1.7/sec)`;
 		}
 	}
 
 	if (toast) {
 		toast.style = Toast.Style.Success;
 		toast.title = "Clipboard history imported";
-		toast.message = `${imported} entries copied into Vicinae's history.`;
+		toast.message = `${imported} entries copied into Vicinae's history${
+			clipboardErrors && clipboardErrors.length > 0 ? `, ${clipboardErrors.length} failed` : ""
+		}.`;
 	}
 
-	return { status: "ok", imported, skippedDupes, skippedImagesFiles, skippedEmpty };
+	return {
+		status: "ok",
+		imported,
+		skippedDupes,
+		skippedImagesFiles,
+		skippedEmpty,
+		errors: clipboardErrors ?? [],
+	};
 }
 
 // ---- UI ----
@@ -397,10 +629,12 @@ function ImportForm() {
 
 			let entries: { name: string; text: string; keyword?: string }[];
 			let clipboard: ClipboardRecord[];
+			let emojis: RaycastEmoji[];
 			try {
 				const parsed = readExportSnippets(file, passphrase);
 				entries = parsed.snippets;
 				clipboard = parsed.clipboard;
+				emojis = parsed.emoji;
 			} catch (err) {
 				// diagnostics: dump what the app actually delivered (no plaintext passphrase — length only)
 				try {
@@ -485,6 +719,10 @@ function ImportForm() {
 				clipResult = await importClipboardHistory(clipboard);
 			}
 
+			// emoji metadata (frecency + custom keywords) — safe atomic merge
+			const includeEmoji = Boolean(input.importEmoji);
+			const emojiImported = includeEmoji ? importEmojiMetadata(emojis) : 0;
+
 			push(
 				<ResultList
 					imported={imported}
@@ -492,6 +730,7 @@ function ImportForm() {
 					totalExported={entries.length}
 					replace={replace}
 					clipResult={clipResult}
+					emojiImported={emojiImported}
 				/>,
 			);
 		} catch (err) {
@@ -562,6 +801,18 @@ function ImportForm() {
 					"Clipboard import is only available from a .rayconfig backup. It copies each text/link entry through Vicinae's own clipboard recorder (works with encryption on, and searchable afterwards). Images/files aren't included (no body in the export). Runs ~1.7 entries/sec, so the full set takes roughly 45-50 minutes — your clipboard will be overwritten as it goes."
 				}
 			/>
+			<Form.Checkbox
+				id="importEmoji"
+				title="Import emoji history"
+				label="Also import emoji frequency + custom keywords from this backup"
+				defaultValue={false}
+				storeValue={true}
+			/>
+			<Form.Description
+				text={
+					"Emoji import restores your frequently-used emoji (ranking) and custom keyword search terms. The emoji table itself is built into Vicinae — this imports metadata only."
+				}
+			/>
 		</Form>
 	);
 }
@@ -572,12 +823,14 @@ function ResultList({
 	totalExported,
 	replace,
 	clipResult,
+	emojiImported,
 }: {
 	imported: VicinaeSnippet[];
 	skipped: string[];
 	totalExported: number;
 	replace: boolean;
 	clipResult: ClipboardImportResult | null;
+	emojiImported: number;
 }) {
 	const clipNote =
 		clipResult && clipResult.status === "ok"
@@ -616,13 +869,21 @@ function ResultList({
 				)}
 			</List.Section>
 			<List.Section
-				title={clipNote ? "Clipboard" : "⚠️ Restart required"}
+				title={
+					emojiImported > 0
+						? `Emoji (${emojiImported} merged)`
+						: clipNote
+							? "Clipboard"
+							: "⚠️ Restart required"
+				}
 				subtitle={
-					clipNote
-						? clipNote
-						: replace
-							? "Vicinae snippets were replaced. Quit and reopen Vicinae."
-							: "Quit and reopen Vicinae for the imported snippets to appear."
+					emojiImported > 0
+						? "Emoji frequency + keywords restored. Restart Vicinae to show them."
+						: clipNote
+							? clipNote
+							: replace
+								? "Vicinae snippets were replaced. Quit and reopen Vicinae."
+								: "Quit and reopen Vicinae for the imported snippets to appear."
 				}
 			>
 				<List.Item
