@@ -1,6 +1,8 @@
-# raycast-import
+# Vicinae Raycast Import
 
-Import data exported from Raycast into Vicinae.
+Import data exported from the official Raycast app into [Vicinae](https://github.com/vicinaehq/vicinae).
+
+> Store listing name: **raycast-import** — in the Vicinae extension store this extension appears as "Import Raycast Data".
 
 **Currently: snippets + clipboard history (text/links) + emoji history.** Reads either:
 - a **plain `.json`** from Raycast's **"Export Snippets"** command (unencrypted), or

@@ -2,6 +2,7 @@
 	"$schema": "https://raw.githubusercontent.com/vicinaehq/vicinae/refs/heads/main/extra/schemas/extension.json",
 	"name": "raycast-import",
 	"title": "Raycast Import",
+	"version": "0.2.0",
 	"description": "Import data exported from Raycast (snippets, clipboard history, emoji) into Vicinae.",
 	"categories": ["Productivity", "Data"],
 	"license": "MIT",
