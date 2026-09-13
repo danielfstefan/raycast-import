@@ -706,7 +706,10 @@ function ImportForm() {
 			: (input.raycastFile as string | undefined);
 		const replace = Boolean(input.replaceExisting);
 		const includeClipboard = Boolean(input.importClipboard);
-		const includeExtensions = Boolean(input.importExtensions);
+		// Pre-picking extensions (Choose extensions… button) implies importing them,
+		// even if the mount-time checkbox default was false.
+		const includeExtensions =
+			Boolean(input.importExtensions) || pickedExtensions !== null;
 		const passphrase = String(input.passphrase ?? "");
 
 		setSubmitting(true);
