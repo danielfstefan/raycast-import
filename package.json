@@ -2,7 +2,7 @@
 	"$schema": "https://raw.githubusercontent.com/vicinaehq/vicinae/refs/heads/main/extra/schemas/extension.json",
 	"name": "raycast-import",
 	"title": "Raycast Import",
-	"description": "Import data exported from Raycast into Vicinae. v1: imports snippet JSON (Export Snippets) into Vicinae's snippet store.",
+	"description": "Import data exported from Raycast (snippets, clipboard history, emoji) into Vicinae.",
 	"categories": ["Productivity", "Data"],
 	"license": "MIT",
 	"author": "danielfstefan",
@@ -11,9 +11,9 @@
 	"icon": "extension_icon.png",
 	"commands": [
 		{
-			"name": "import-snippets",
-			"title": "Import Raycast Snippets",
-			"description": "Import snippets from a Raycast 'Export Snippets' JSON file",
+			"name": "import-data",
+			"title": "Import Raycast Data",
+			"description": "Import snippets, clipboard history, and emoji history from a Raycast export (.json or encrypted .rayconfig)",
 			"mode": "view"
 		}
 	],
