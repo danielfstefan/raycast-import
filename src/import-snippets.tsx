@@ -13,6 +13,7 @@ import { useState } from "react";
 import {
 	Action,
 	ActionPanel,
+	Clipboard,
 	Form,
 	Icon,
 	List,
@@ -284,161 +285,88 @@ function readExisting(): VicinaeSnippet[] {
 	}
 }
 
-// ---- Clipboard history import (v1: text + link records) ----
+// ---- Clipboard history import ----
+//
+// Design (verified in host source): we do NOT write Vicinae's clipboard SQLite
+// store directly. The extension's Clipboard.copy() RPC goes through
+// ExtClipboardService::copy → ClipboardService::copyContent → macOS
+// writeClipboard → the app's own poll() → selectionAdded → saveSelection, which
+// dedupes by content hash (tryBubbleUpSelection) and inserts into the encrypted
+// DB with the app's in-process key. So encryption is transparent and imported
+// entries get built-in search indexing (fuzzy_trigram FTS) — exactly like
+// copy-pasting each entry yourself.
+//
+// Pacing: the macOS clipboard server polls on a 500ms tick and only ONE pasteboard
+// change is observed per tick. So we copy one entry every ~600ms — the import runs
+// at ~1.7 entries/sec. ~4,900 text+link records ≈ 45-50 minutes.
 
 type ClipboardRecord = { text: string; category: string; applicationPath?: string };
 
 type ClipboardImportResult =
 	| { status: "ok"; imported: number; skippedDupes: number; skippedImagesFiles: number; skippedEmpty: number }
-	| { status: "encrypted"; message: string }
-	| { status: "no-db" }
-	| { status: "no-sqlite" };
+	| { status: "no-records" };
 
-const SQLITE_MAGIC = "SQLite format 3";
+const CLIPBOARD_COPY_INTERVAL_MS = 600;
 
-function md5Hex(data: Buffer | string): string {
-	return createHash("md5").update(data).digest("hex");
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Node 22.5+ ships node:sqlite; the ext worker runs Node 22.23.1.
-// @ts-expect-error node:sqlite types may not exist on older @types/node
-function newClipboardDb(path: string) {
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
-	const mod = require("node:sqlite") as { DatabaseSync: new (p: string) => SqliteDb };
-	return new mod.DatabaseSync(path);
-}
+async function importClipboardHistory(records: ClipboardRecord[]): Promise<ClipboardImportResult> {
+	if (records.length === 0) return { status: "no-records" };
 
-interface SqliteDb {
-	exec(sql: string): void;
-	close(): void;
-	prepare(sql: string): {
-		run(...params: (string | number | null)[]): { changes?: number };
-		all(...params: (string | number | null)[]): Record<string, unknown>[];
-		get?(...params: unknown[]): Record<string, unknown> | undefined;
-	};
-}
+	let imported = 0;
+	let skippedDupes = 0;
+	let skippedImagesFiles = 0;
+	let skippedEmpty = 0;
 
-function clipboardDbPath(): string {
-	return join(dataDir(), "clipboard.db");
-}
-
-function clipboardDataDir(): string {
-	return join(dataDir(), "clipboard-data");
-}
-
-// uuid without braces/lowercase — matches QUuid::createUuid().toString(WithoutBraces)
-function clipUuid(): string {
-	const hex = "0123456789abcdef";
-	let out = "";
-	for (let i = 0; i < 32; i++) out += hex[Math.floor(Math.random() * 16)];
-	return out;
-}
-
-function importClipboardHistory(records: ClipboardRecord[]): ClipboardImportResult {
-	if (records.length === 0) return { status: "ok", imported: 0, skippedDupes: 0, skippedImagesFiles: 0, skippedEmpty: 0 };
-
-	const dbPath = clipboardDbPath();
-	if (!existsSync(dbPath)) return { status: "no-db" };
-
-	// SQLCipher-encrypted DBs don't start with the SQLite magic string.
-	const head = readFileSync(dbPath).subarray(0, 16).toString("utf8");
-	if (!head.startsWith(SQLITE_MAGIC)) {
-		return {
-			status: "encrypted",
-			message:
-				"Vicinae encrypts its clipboard database (SQLCipher). The importer can't write to an encrypted DB — disable 'Encrypt sensitive data' in Settings, restart Vicinae, re-import, then re-enable.",
-		};
-	}
-
-	let db: SqliteDb;
+	let toast: Toast | null = null;
 	try {
-		db = newClipboardDb(dbPath);
+		toast = await showToast({
+			style: Toast.Style.Animated,
+			title: "Importing clipboard history…",
+			message: "0% — copying entries through Vicinae's recorder",
+		});
 	} catch {
-		return { status: "no-sqlite" };
+		toast = null;
 	}
 
-	try {
-		db.exec("PRAGMA busy_timeout = 5000");
-		// dedupe against existing content (md5 hex, same as the core's content_hash_md5)
-		const existing = new Set<string>();
-		for (const row of db.prepare("SELECT content_hash_md5 FROM data_offer").all()) {
-			const h = row["content_hash_md5"];
-			if (typeof h === "string") existing.add(h);
+	const total = records.length;
+	let lastReport = Date.now();
+
+	for (const r of records) {
+		if (r.category !== "text" && r.category !== "link") {
+			skippedImagesFiles++;
+			continue;
 		}
-
-		const now = Math.floor(Date.now() / 1000);
-		const selStmt = db.prepare(
-			`INSERT INTO selection (id, hash_md5, preferred_mime_type, source, offer_count, created_at, updated_at, pinned_at, kind, keywords)
-			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		);
-		const offStmt = db.prepare(
-			`INSERT INTO data_offer (id, selection_id, mime_type, text_preview, content_hash_md5, size, encryption_type, kind, url_host)
-			 VALUES (?,?,?,?,?,?,?,?,?)`,
-		);
-
-		let imported = 0;
-		let skippedDupes = 0;
-		let skippedImagesFiles = 0;
-		let skippedEmpty = 0;
-
-		db.exec("BEGIN");
-		try {
-			for (const r of records) {
-				if (r.category !== "text" && r.category !== "link") {
-					skippedImagesFiles++;
-					continue;
-				}
-				const text = (r.text ?? "").toString();
-				if (!text) { skippedEmpty++; continue; }
-				const body = Buffer.from(text, "utf8");
-				const contentHash = md5Hex(body);
-				if (existing.has(contentHash)) { skippedDupes++; continue; }
-
-				const selectionId = clipUuid();
-				const offerId = clipUuid();
-				const isLink = r.category === "link";
-				const kind = isLink ? 2 : 1; // ClipboardOfferKind: Text=1, Link=2
-
-				selStmt.run(
-					selectionId,
-					contentHash,
-					"text/plain",
-					r.applicationPath ?? null,
-					1,
-					now,
-					now,
-					null,
-					kind,
-					"",
-				);
-				offStmt.run(
-					offerId,
-					selectionId,
-					"text/plain",
-					text.replace(/\s+/g, " ").trim().slice(0, 50),
-					contentHash,
-					body.length,
-					0, // EncryptionType::None
-					kind,
-					null,
-				);
-				// content file: <dataDir>/<offer.id>
-				mkdirSync(clipboardDataDir(), { recursive: true });
-				writeFileSync(join(clipboardDataDir(), offerId), body);
-
-				// FTS: tokenizer (fuzzy_trigram) is core-registered; a plain connection can't
-				// populate selection_fts, so imported entries browse but full-text search misses them.
-				existing.add(contentHash);
-				imported++;
-			}
-		} finally {
-			db.exec("COMMIT");
+		const text = (r.text ?? "").toString();
+		if (!text) {
+			skippedEmpty++;
+			continue;
 		}
+		// concealed=false (default): the copy is observed and recorded into history.
+		// Re-copying identical text bubbles to the top instead of duplicating.
+		await Clipboard.copy(text);
+		// one pasteboard change per poll tick (500ms) — leave margin
+		await sleep(CLIPBOARD_COPY_INTERVAL_MS);
+		imported++;
 
-		return { status: "ok", imported, skippedDupes, skippedImagesFiles, skippedEmpty };
-	} finally {
-		db.close();
+		// throttle toast updates to ~2/sec
+		const now = Date.now();
+		if (toast && now - lastReport > 500) {
+			lastReport = now;
+			const pct = Math.round((imported / total) * 100);
+			toast.message = `${pct}% — ${imported}/${total} (runs at ~1.7/sec)`;
+		}
 	}
+
+	if (toast) {
+		toast.style = Toast.Style.Success;
+		toast.title = "Clipboard history imported";
+		toast.message = `${imported} entries copied into Vicinae's history.`;
+	}
+
+	return { status: "ok", imported, skippedDupes, skippedImagesFiles, skippedEmpty };
 }
 
 // ---- UI ----
@@ -554,7 +482,7 @@ function ImportForm() {
 			// clipboard history (only meaningful for .rayconfig backups)
 			let clipResult: ClipboardImportResult | null = null;
 			if (includeClipboard && clipboard.length > 0) {
-				clipResult = importClipboardHistory(clipboard);
+				clipResult = await importClipboardHistory(clipboard);
 			}
 
 			push(
@@ -631,7 +559,7 @@ function ImportForm() {
 			/>
 			<Form.Description
 				text={
-					"Clipboard import is only available from a .rayconfig backup. Images and files aren't included (no body in the export). Requires the clipboard DB to be unencrypted — see the result list if it's not."
+					"Clipboard import is only available from a .rayconfig backup. It copies each text/link entry through Vicinae's own clipboard recorder (works with encryption on, and searchable afterwards). Images/files aren't included (no body in the export). Runs ~1.7 entries/sec, so the full set takes roughly 45-50 minutes — your clipboard will be overwritten as it goes."
 				}
 			/>
 		</Form>
@@ -653,14 +581,8 @@ function ResultList({
 }) {
 	const clipNote =
 		clipResult && clipResult.status === "ok"
-			? `${clipResult.imported} clipboard entries imported${clipResult.skippedDupes ? `, ${clipResult.skippedDupes} duplicates skipped` : ""}${clipResult.skippedImagesFiles ? `, ${clipResult.skippedImagesFiles} image/file entries skipped` : ""}`
-			: clipResult?.status === "encrypted"
-				? "⚠️ Clipboard encrypted — see toast"
-				: clipResult?.status === "no-db"
-					? "Clipboard db not found"
-					: clipResult?.status === "no-sqlite"
-						? "node:sqlite unavailable"
-						: null;
+			? `${clipResult.imported} clipboard entries imported${clipResult.skippedDupes ? `, ${clipResult.skippedDupes} already in history (bubbled)` : ""}${clipResult.skippedImagesFiles ? `, ${clipResult.skippedImagesFiles} image/file entries skipped` : ""}`
+			: null;
 	return (
 		<List isLoading={false} navigationTitle="Import result">
 			<List.Section title="Imported" subtitle={`${imported.length} of ${totalExported} snippets`}>
@@ -693,15 +615,6 @@ function ResultList({
 					/>
 				)}
 			</List.Section>
-			{clipResult?.status === "encrypted" && (
-				<List.Section title="Clipboard">
-					<List.Item
-						title="Clipboard history already encrypted"
-						subtitle="Disable 'Encrypt sensitive data' in Settings, restart Vicinae, re-import, then re-enable."
-						icon={Icon.Shield}
-					/>
-				</List.Section>
-			)}
 			<List.Section
 				title={clipNote ? "Clipboard" : "⚠️ Restart required"}
 				subtitle={
