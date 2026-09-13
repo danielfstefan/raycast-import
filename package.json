@@ -21,7 +21,8 @@
 			"name": "import-background",
 			"title": "Import Raycast Data (background)",
 			"description": "Headless helper: replays clipboard history through Vicinae's recorder and installs the picked extensions from the official Raycast store. Launched automatically by 'Import Raycast Data' — no need to run this directly.",
-			"mode": "no-view"
+			"mode": "no-view",
+			"disabledByDefault": true
 		}
 	],
 	"preferences": [],
